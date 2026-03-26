@@ -6,14 +6,18 @@ Huawei DN8245V-56 configuration decryption helper.
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 decrypt_huawei.py ./hw_ctree.xml --mac AA:03:7B:DB --output decrypted_output.bin
+python3 decrypt_huawei.py ./hw_ctree.xml \
+  --serial 45475445AA037BDB \
+  --mac A4:6D:A4:8D:D0:79 \
+  --output decrypted_output.bin
 ```
 
 The script:
-- strips the proprietary 12-byte Huawei header (default)
-- tries common DN8245V AES keys and IVs
-- optionally derives salted key variants from a MAC/serial hint (`--mac`)
-- attempts second-pass `gzip`, `zlib`, or raw `deflate` decompression
+- tries hardware-derived key hypotheses (SN/MAC/master-key based) plus legacy keys
+- iterates a built-in list of common header offsets (or custom `--offsets`)
+- tests AES-CBC with legacy IVs plus SN/MAC-derived IV hypotheses
+- performs sliding decompression search in the first 128 bytes for `zlib`, `gzip`, and raw `deflate`
 - prints a preview and can save the best candidate with `--output`
+- fails with a non-zero exit when no high-confidence XML candidate is found
 
 Use `--help` to view all options.
