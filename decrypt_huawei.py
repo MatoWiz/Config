@@ -37,8 +37,11 @@ def _pkcs7_unpad(data: bytes) -> bytes:
 
 
 def _looks_like_xml(data: bytes) -> bool:
-    preview = data.lstrip()[:64].lower()
-    return preview.startswith(b"<?xml") or preview.startswith(b"<")
+    preview = data.lstrip()[:256].lower()
+    if not (preview.startswith(b"<?xml") or preview.startswith(b"<")):
+        return False
+    # Filter out binary false positives that happen to start with "<".
+    return b"</" in preview or b'="' in preview or b"='" in preview
 
 
 def _search_decompression(data: bytes, max_shift: int = 128) -> tuple[bytes, Optional[str], int]:
@@ -163,6 +166,12 @@ def score_output(data: bytes) -> int:
         score += 10
     printable = sum(1 for b in data[:256] if 9 <= b <= 13 or 32 <= b <= 126)
     score += printable
+    unique_bytes = len(set(data[:256]))
+    if unique_bytes > 120:
+        score = max(0, score - 80)
+    control_bytes = sum(1 for b in data[:256] if b < 9 or (14 <= b <= 31))
+    if control_bytes > 16:
+        score = max(0, score - 40)
     return score
 
 
