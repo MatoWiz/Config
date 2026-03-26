@@ -53,20 +53,26 @@ def _search_decompression(data: bytes, max_shift: int = 128) -> tuple[bytes, Opt
         for name, wbits in decompressors:
             try:
                 return zlib.decompress(chunk, wbits), name, shift
-            except Exception:
+            except zlib.error:
                 continue
     return data, None, 0
 
 
 def _mac_variants(mac_hint: str) -> list[bytes]:
+    def _ascii(value: str) -> Optional[bytes]:
+        try:
+            return value.encode("ascii")
+        except UnicodeEncodeError:
+            return None
+
     clean = mac_hint.replace(":", "").replace("-", "").strip()
     variants = [
-        mac_hint.encode("ascii", "ignore"),
-        mac_hint.upper().encode("ascii", "ignore"),
-        mac_hint.lower().encode("ascii", "ignore"),
-        clean.encode("ascii", "ignore"),
-        clean.upper().encode("ascii", "ignore"),
-        clean.lower().encode("ascii", "ignore"),
+        _ascii(mac_hint),
+        _ascii(mac_hint.upper()),
+        _ascii(mac_hint.lower()),
+        _ascii(clean),
+        _ascii(clean.upper()),
+        _ascii(clean.lower()),
     ]
     if clean:
         try:
@@ -85,7 +91,7 @@ def _mac_variants(mac_hint: str) -> list[bytes]:
 
 def build_candidate_keys(serial: Optional[str], mac_hint: Optional[str]) -> list[tuple[bytes, str]]:
     dot_32 = bytes([0x2E]) * 32
-    master_we = bytes.fromhex("13395537D2730554A176799F6D56A239")
+    huawei_master_key_we = bytes.fromhex("13395537D2730554A176799F6D56A239")
     keys: list[tuple[bytes, str]] = []
 
     # H1: SHA256("."*32 + SN)
@@ -96,8 +102,8 @@ def build_candidate_keys(serial: Optional[str], mac_hint: Optional[str]) -> list
         keys.append((hashlib.sha256(sn + dot_32).digest(), "H2:sha256(sn+dot32)"))
 
     # H3: WE Egypt Master key
-    keys.append((master_we, "H3:we-master-raw"))
-    keys.append((hashlib.sha256(master_we).digest(), "H3:sha256(we-master)"))
+    keys.append((huawei_master_key_we, "H3:we-master-raw"))
+    keys.append((hashlib.sha256(huawei_master_key_we).digest(), "H3:sha256(we-master)"))
 
     # H4: MAC-based hashes in different formats
     if mac_hint:
@@ -198,7 +204,7 @@ def main() -> int:
                 continue
         try:
             decrypted = decrypt_payload(payload, candidate)
-        except Exception as exc:
+        except ValueError as exc:
             print(
                 f"[-] {candidate.name} | off={candidate.offset} | iv={candidate.iv.hex()} failed: "
                 f"{type(exc).__name__}: {exc}"
