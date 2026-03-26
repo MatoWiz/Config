@@ -4,23 +4,24 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
 import sys
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 from Crypto.Cipher import AES
 
 XML_BONUS_SCORE = 1000
+DEFAULT_OFFSETS = (0, 4, 8, 12, 14, 16, 24, 32)
 
 
 @dataclass(frozen=True)
 class Candidate:
     key: bytes
     iv: bytes
+    offset: int
     name: str
 
 
@@ -40,61 +41,96 @@ def _looks_like_xml(data: bytes) -> bool:
     return preview.startswith(b"<?xml") or preview.startswith(b"<")
 
 
-def _maybe_decompress(data: bytes) -> tuple[bytes, Optional[str]]:
+def _search_decompression(data: bytes, max_shift: int = 128) -> tuple[bytes, Optional[str], int]:
     decompressors = (
-        ("gzip", gzip.decompress),
-        ("zlib", zlib.decompress),
-        ("deflate", lambda v: zlib.decompress(v, -zlib.MAX_WBITS)),
+        ("zlib", 15),
+        ("gzip", 31),
+        ("deflate", -15),
     )
-    for name, fn in decompressors:
+    upper = min(max_shift, len(data))
+    for shift in range(upper):
+        chunk = data[shift:]
+        for name, wbits in decompressors:
+            try:
+                return zlib.decompress(chunk, wbits), name, shift
+            except Exception:
+                continue
+    return data, None, 0
+
+
+def _mac_variants(mac_hint: str) -> list[bytes]:
+    clean = mac_hint.replace(":", "").replace("-", "").strip()
+    variants = [
+        mac_hint.encode("ascii", "ignore"),
+        mac_hint.upper().encode("ascii", "ignore"),
+        mac_hint.lower().encode("ascii", "ignore"),
+        clean.encode("ascii", "ignore"),
+        clean.upper().encode("ascii", "ignore"),
+        clean.lower().encode("ascii", "ignore"),
+    ]
+    if clean:
         try:
-            return fn(data), name
-        except Exception:
-            continue
-    return data, None
-
-
-def _derive_salted_candidates(base_key: bytes, salt: bytes, key_len: int) -> Iterable[bytes]:
-    seed = base_key + salt
-    if key_len == 16:
-        yield hashlib.md5(seed).digest()
-    yield hashlib.sha256(seed).digest()[:key_len]
-
-
-def build_candidates(mac_hint: Optional[str]) -> list[Candidate]:
-    key_dot_32 = bytes([0x2E]) * 32
-    key_hw_16 = bytes.fromhex("e84e891d5e7258628abed2f5a45fad5a")
-    ivs = (bytes([0x30]) * 16, bytes(16))
-
-    candidates: list[Candidate] = []
-    for iv in ivs:
-        candidates.append(Candidate(key_dot_32, iv, "dot-key-32"))
-        candidates.append(Candidate(key_hw_16, iv, "huawei-hw-key-16"))
-
-    if mac_hint:
-        mac_clean = mac_hint.replace(":", "").replace("-", "").strip()
-        salts = []
-        try:
-            salts.append(bytes.fromhex(mac_clean))
+            variants.append(bytes.fromhex(clean))
         except ValueError:
             pass
-        salts.append(mac_clean.encode("ascii", "ignore"))
-        salts.append(mac_hint.encode("ascii", "ignore"))
+    dedup: list[bytes] = []
+    seen = set()
+    for variant in variants:
+        if not variant or variant in seen:
+            continue
+        seen.add(variant)
+        dedup.append(variant)
+    return dedup
 
-        for salt in salts:
-            if not salt:
-                continue
-            for iv in ivs:
-                for derived in _derive_salted_candidates(key_dot_32, salt, 32):
-                    candidates.append(Candidate(derived, iv, f"dot-key-32+salt:{mac_hint}"))
-                for derived in _derive_salted_candidates(key_hw_16, salt, 16):
-                    candidates.append(Candidate(derived, iv, f"huawei-hw-key-16+salt:{mac_hint}"))
 
-    # Stable de-duplication while preserving order.
+def build_candidate_keys(serial: Optional[str], mac_hint: Optional[str]) -> list[tuple[bytes, str]]:
+    dot_32 = bytes([0x2E]) * 32
+    master_we = bytes.fromhex("13395537D2730554A176799F6D56A239")
+    keys: list[tuple[bytes, str]] = []
+
+    # H1: SHA256("."*32 + SN)
+    if serial:
+        sn = serial.encode("ascii", "ignore")
+        keys.append((hashlib.sha256(dot_32 + sn).digest(), "H1:sha256(dot32+sn)"))
+        # H2: SHA256(SN + "."*32)
+        keys.append((hashlib.sha256(sn + dot_32).digest(), "H2:sha256(sn+dot32)"))
+
+    # H3: WE Egypt Master key
+    keys.append((master_we, "H3:we-master-raw"))
+    keys.append((hashlib.sha256(master_we).digest(), "H3:sha256(we-master)"))
+
+    # H4: MAC-based hashes in different formats
+    if mac_hint:
+        for mac in _mac_variants(mac_hint):
+            keys.append((hashlib.md5(mac).digest(), "H4:md5(mac-variant)"))
+            keys.append((hashlib.sha256(mac).digest(), "H4:sha256(mac-variant)"))
+
+    # Keep existing known keys for backward compatibility.
+    keys.append((dot_32, "legacy:dot-key-32"))
+    keys.append((bytes.fromhex("e84e891d5e7258628abed2f5a45fad5a"), "legacy:huawei-hw-key-16"))
+
+    dedup: list[tuple[bytes, str]] = []
+    seen = set()
+    for key, name in keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append((key, name))
+    return dedup
+
+
+def build_candidates(serial: Optional[str], mac_hint: Optional[str], offsets: tuple[int, ...]) -> list[Candidate]:
+    ivs = (bytes([0x30]) * 16, bytes(16))
+    candidates: list[Candidate] = []
+    for key, name in build_candidate_keys(serial, mac_hint):
+        for iv in ivs:
+            for offset in offsets:
+                candidates.append(Candidate(key=key, iv=iv, offset=offset, name=name))
+
     dedup: list[Candidate] = []
     seen = set()
     for c in candidates:
-        marker = (c.key, c.iv)
+        marker = (c.key, c.iv, c.offset)
         if marker in seen:
             continue
         seen.add(marker)
@@ -108,13 +144,11 @@ def decrypt_payload(payload: bytes, candidate: Candidate) -> bytes:
     return _pkcs7_unpad(decrypted)
 
 
-def read_payload(path: Path, header_len: int) -> bytes:
+def read_payload(path: Path) -> bytes:
     blob = path.read_bytes()
-    if len(blob) <= header_len:
-        raise ValueError(f"File too short ({len(blob)} bytes) to strip {header_len}-byte header")
     if not blob.startswith(bytes.fromhex("02000000")):
         print("[!] Warning: file does not start with 02 00 00 00", file=sys.stderr)
-    return blob[header_len:]
+    return blob
 
 
 def score_output(data: bytes) -> int:
@@ -129,51 +163,74 @@ def score_output(data: bytes) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Decrypt Huawei DN8245V-56 hw_ctree exports")
     parser.add_argument("input", help="Path to hw_ctree.xml (or raw exported encrypted file)")
-    parser.add_argument("--header-len", type=int, default=12, help="Huawei header length (default: 12)")
+    parser.add_argument("--serial", help="Serial number (example: 45475445AA037BDB)")
     parser.add_argument(
         "--mac",
-        help="Optional MAC/serial hint for salted key tries (example: AA:03:7B:DB)",
+        help="MAC address hint (example: A4:6D:A4:8D:D0:79)",
+    )
+    parser.add_argument(
+        "--offsets",
+        default=",".join(str(v) for v in DEFAULT_OFFSETS),
+        help="Comma-separated header offsets to test (default: 0,4,8,12,14,16,24,32)",
     )
     parser.add_argument("--output", help="Path to write best decrypted result")
     parser.add_argument("--show-bytes", type=int, default=512, help="Preview byte count to print")
     args = parser.parse_args()
 
-    payload = read_payload(Path(args.input), args.header_len)
-    if len(payload) % 16 != 0:
-        trunc = len(payload) % 16
-        print(f"[!] Payload length {len(payload)} is not multiple of 16; truncating {trunc} trailing bytes")
-        payload = payload[:-trunc]
+    try:
+        offsets = tuple(int(v.strip()) for v in args.offsets.split(",") if v.strip())
+    except ValueError:
+        print("[!] --offsets must be a comma-separated list of integers")
+        return 2
 
-    best: tuple[int, bytes, Candidate, Optional[str]] | None = None
-    for candidate in build_candidates(args.mac):
+    blob = read_payload(Path(args.input))
+
+    best: tuple[int, bytes, Candidate, Optional[str], int] | None = None
+    for candidate in build_candidates(args.serial, args.mac, offsets):
+        if len(blob) <= candidate.offset:
+            continue
+        payload = blob[candidate.offset :]
+        if len(payload) < 16:
+            continue
+        if len(payload) % 16 != 0:
+            payload = payload[: len(payload) - (len(payload) % 16)]
+            if len(payload) < 16:
+                continue
         try:
             decrypted = decrypt_payload(payload, candidate)
         except Exception as exc:
-            print(f"[-] {candidate.name} | iv={candidate.iv.hex()} failed: {type(exc).__name__}: {exc}")
+            print(
+                f"[-] {candidate.name} | off={candidate.offset} | iv={candidate.iv.hex()} failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
             continue
 
-        final, compression = _maybe_decompress(decrypted)
+        final, compression, shift = _search_decompression(decrypted, max_shift=128)
         score = score_output(final)
         tag = compression if compression else "none"
-        print(f"[+] {candidate.name} | iv={candidate.iv.hex()} | decompress={tag} | score={score}")
+        print(
+            f"[+] {candidate.name} | off={candidate.offset} | iv={candidate.iv.hex()} | "
+            f"decompress={tag}@{shift} | score={score}"
+        )
 
         if best is None or score > best[0]:
-            best = (score, final, candidate, compression)
+            best = (score, final, candidate, compression, shift)
 
         if _looks_like_xml(final):
-            best = (score + XML_BONUS_SCORE, final, candidate, compression)
+            best = (score + XML_BONUS_SCORE, final, candidate, compression, shift)
             break
 
     if best is None:
         print("[!] No successful decryption candidates")
         return 1
 
-    _, data, winner, compression = best
+    _, data, winner, compression, shift = best
     print("\n=== Best Candidate ===")
     print(f"name       : {winner.name}")
+    print(f"offset     : {winner.offset}")
     print(f"key(hex)   : {winner.key.hex()}")
     print(f"iv(hex)    : {winner.iv.hex()}")
-    print(f"compression: {compression or 'none'}")
+    print(f"compression: {(compression or 'none')} (shift={shift})")
 
     preview = data[: args.show_bytes]
     text_preview = preview.decode("utf-8", errors="replace")
