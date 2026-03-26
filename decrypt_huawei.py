@@ -14,7 +14,7 @@ from typing import Optional
 from Crypto.Cipher import AES
 
 XML_BONUS_SCORE = 1000
-DEFAULT_OFFSETS = (0, 4, 8, 12, 14, 16, 24, 32)
+DEFAULT_OFFSETS = (0, 4, 8, 12, 14, 16, 20, 24, 28, 30, 32, 36, 40, 44, 48, 56, 60, 64)
 
 
 @dataclass(frozen=True)
@@ -92,10 +92,24 @@ def _mac_variants(mac_hint: str) -> list[bytes]:
     return dedup
 
 
+def _hex_bytes(value: Optional[str]) -> Optional[bytes]:
+    if not value:
+        return None
+    compact = value.replace(":", "").replace("-", "").strip()
+    if not compact or len(compact) % 2:
+        return None
+    try:
+        return bytes.fromhex(compact)
+    except ValueError:
+        return None
+
+
 def build_candidate_keys(serial: Optional[str], mac_hint: Optional[str]) -> list[tuple[bytes, str]]:
     dot_32 = bytes([0x2E]) * 32
     huawei_master_key_we = bytes.fromhex("13395537D2730554A176799F6D56A239")
     keys: list[tuple[bytes, str]] = []
+    sn_hex = _hex_bytes(serial)
+    mac_hex = _hex_bytes(mac_hint)
 
     # H1: SHA256("."*32 + SN)
     if serial:
@@ -114,6 +128,20 @@ def build_candidate_keys(serial: Optional[str], mac_hint: Optional[str]) -> list
             keys.append((hashlib.md5(mac).digest(), "H4:md5(mac-variant)"))
             keys.append((hashlib.sha256(mac).digest(), "H4:sha256(mac-variant)"))
 
+    # H5: SN/MAC binary concatenation variants.
+    if sn_hex and mac_hex:
+        keys.append((hashlib.md5(sn_hex + mac_hex).digest(), "H5:md5(sn_hex+mac_hex)"))
+        keys.append((hashlib.sha256(sn_hex + mac_hex).digest(), "H5:sha256(sn_hex+mac_hex)"))
+        keys.append((hashlib.md5(mac_hex + sn_hex).digest(), "H5:md5(mac_hex+sn_hex)"))
+        keys.append((hashlib.sha256(mac_hex + sn_hex).digest(), "H5:sha256(mac_hex+sn_hex)"))
+        keys.append((hashlib.sha256(huawei_master_key_we + sn_hex + mac_hex).digest(), "H5:sha256(master+sn+mac)"))
+        keys.append((hashlib.sha256(huawei_master_key_we + sn_hex).digest(), "H6:sha256(master+sn_hex)"))
+        keys.append((hashlib.sha256(huawei_master_key_we + mac_hex).digest(), "H6:sha256(master+mac_hex)"))
+        keys.append((hashlib.sha256(sn_hex + huawei_master_key_we + mac_hex).digest(), "H6:sha256(sn+master+mac)"))
+        inner = hashlib.sha256(sn_hex + mac_hex).digest()
+        keys.append((hashlib.sha256(inner).digest(), "H7:sha256(sha256(sn+mac))"))
+        keys.append((hashlib.md5(inner).digest(), "H7:md5(sha256(sn+mac))"))
+
     # Keep existing known keys for backward compatibility.
     keys.append((dot_32, "legacy:dot-key-32"))
     keys.append((bytes.fromhex("e84e891d5e7258628abed2f5a45fad5a"), "legacy:huawei-hw-key-16"))
@@ -129,10 +157,27 @@ def build_candidate_keys(serial: Optional[str], mac_hint: Optional[str]) -> list
 
 
 def build_candidates(serial: Optional[str], mac_hint: Optional[str], offsets: tuple[int, ...]) -> list[Candidate]:
-    ivs = (bytes([0x30]) * 16, bytes(16))
+    ivs = [bytes([0x30]) * 16, bytes(16)]
+    sn_hex = _hex_bytes(serial)
+    mac_hex = _hex_bytes(mac_hint)
+    if mac_hex:
+        ivs.append(hashlib.md5(mac_hex).digest())
+    if sn_hex:
+        ivs.append(hashlib.md5(sn_hex).digest())
+    if sn_hex and mac_hex:
+        ivs.append(hashlib.sha256(sn_hex + mac_hex).digest()[:16])
+
+    dedup_ivs: list[bytes] = []
+    seen_ivs = set()
+    for iv in ivs:
+        if iv in seen_ivs:
+            continue
+        seen_ivs.add(iv)
+        dedup_ivs.append(iv)
+
     candidates: list[Candidate] = []
     for key, name in build_candidate_keys(serial, mac_hint):
-        for iv in ivs:
+        for iv in dedup_ivs:
             for offset in offsets:
                 candidates.append(Candidate(key=key, iv=iv, offset=offset, name=name))
 
@@ -162,7 +207,8 @@ def read_payload(path: Path) -> bytes:
 
 def score_output(data: bytes) -> int:
     score = 0
-    if _looks_like_xml(data):
+    xml_like = _looks_like_xml(data)
+    if xml_like:
         score += 10
     printable = sum(1 for b in data[:256] if 9 <= b <= 13 or 32 <= b <= 126)
     score += printable
@@ -175,6 +221,9 @@ def score_output(data: bytes) -> int:
     control_bytes = sum(1 for b in data[:256] if b < 9 or (14 <= b <= 31))
     if control_bytes > 16:
         score = max(0, score - 40)
+    if not xml_like:
+        # Keep non-XML outputs out of high-confidence territory.
+        score = min(score, 99)
     return score
 
 
@@ -189,7 +238,7 @@ def main() -> int:
     parser.add_argument(
         "--offsets",
         default=",".join(str(v) for v in DEFAULT_OFFSETS),
-        help="Comma-separated header offsets to test (default: 0,4,8,12,14,16,24,32)",
+        help="Comma-separated header offsets to test (default: built-in offset list)",
     )
     parser.add_argument("--output", help="Path to write best decrypted result")
     parser.add_argument("--show-bytes", type=int, default=512, help="Preview byte count to print")

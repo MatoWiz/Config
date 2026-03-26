@@ -14,9 +14,10 @@ python3 decrypt_huawei.py ./hw_ctree.xml \
 
 The script:
 - tries hardware-derived key hypotheses (SN/MAC/master-key based) plus legacy keys
-- iterates header offsets `0,4,8,12,14,16,24,32`
-- tests AES-CBC with IVs of `0x00 * 16` and `0x30 * 16`
+- iterates a built-in list of common header offsets (or custom `--offsets`)
+- tests AES-CBC with legacy IVs plus SN/MAC-derived IV hypotheses
 - performs sliding decompression search in the first 128 bytes for `zlib`, `gzip`, and raw `deflate`
 - prints a preview and can save the best candidate with `--output`
+- fails with a non-zero exit when no high-confidence XML candidate is found
 
 Use `--help` to view all options.
