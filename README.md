@@ -6,7 +6,7 @@ Huawei DN8245V-56 configuration decryption helper.
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 decrypt_huawei.py /home/runner/work/Config/Config/hw_ctree.xml.html --output decrypted_output.bin
+python3 decrypt_huawei.py ./hw_ctree.xml --mac AA:03:7B:DB --output decrypted_output.bin
 ```
 
 The script:

@@ -14,6 +14,8 @@ from typing import Iterable, Optional
 
 from Crypto.Cipher import AES
 
+XML_BONUS_SCORE = 1000
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -128,22 +130,26 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Decrypt Huawei DN8245V-56 hw_ctree exports")
     parser.add_argument("input", help="Path to hw_ctree.xml (or raw exported encrypted file)")
     parser.add_argument("--header-len", type=int, default=12, help="Huawei header length (default: 12)")
-    parser.add_argument("--mac", default="AA:03:7B:DB", help="Optional MAC/serial hint for salted key tries")
+    parser.add_argument(
+        "--mac",
+        help="Optional MAC/serial hint for salted key tries (example: AA:03:7B:DB)",
+    )
     parser.add_argument("--output", help="Path to write best decrypted result")
     parser.add_argument("--show-bytes", type=int, default=512, help="Preview byte count to print")
     args = parser.parse_args()
 
     payload = read_payload(Path(args.input), args.header_len)
     if len(payload) % 16 != 0:
-        print(f"[!] Payload length {len(payload)} is not multiple of 16; truncating trailing bytes")
-        payload = payload[: len(payload) - (len(payload) % 16)]
+        trunc = len(payload) % 16
+        print(f"[!] Payload length {len(payload)} is not multiple of 16; truncating {trunc} trailing bytes")
+        payload = payload[:-trunc]
 
     best: tuple[int, bytes, Candidate, Optional[str]] | None = None
     for candidate in build_candidates(args.mac):
         try:
             decrypted = decrypt_payload(payload, candidate)
         except Exception as exc:
-            print(f"[-] {candidate.name} | iv={candidate.iv.hex()} failed: {exc}")
+            print(f"[-] {candidate.name} | iv={candidate.iv.hex()} failed: {type(exc).__name__}: {exc}")
             continue
 
         final, compression = _maybe_decompress(decrypted)
@@ -155,7 +161,7 @@ def main() -> int:
             best = (score, final, candidate, compression)
 
         if _looks_like_xml(final):
-            best = (score + 1000, final, candidate, compression)
+            best = (score + XML_BONUS_SCORE, final, candidate, compression)
             break
 
     if best is None:
