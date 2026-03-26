@@ -106,6 +106,7 @@ def _hex_bytes(value: Optional[str]) -> Optional[bytes]:
 
 def build_candidate_keys(serial: Optional[str], mac_hint: Optional[str]) -> list[tuple[bytes, str]]:
     dot_32 = bytes([0x2E]) * 32
+    # Publicly documented provider-level master key hypothesis used by prior tooling/research.
     huawei_master_key_we = bytes.fromhex("13395537D2730554A176799F6D56A239")
     keys: list[tuple[bytes, str]] = []
     sn_hex = _hex_bytes(serial)
@@ -134,7 +135,7 @@ def build_candidate_keys(serial: Optional[str], mac_hint: Optional[str]) -> list
         keys.append((hashlib.sha256(sn_hex + mac_hex).digest(), "H5:sha256(sn_hex+mac_hex)"))
         keys.append((hashlib.md5(mac_hex + sn_hex).digest(), "H5:md5(mac_hex+sn_hex)"))
         keys.append((hashlib.sha256(mac_hex + sn_hex).digest(), "H5:sha256(mac_hex+sn_hex)"))
-        keys.append((hashlib.sha256(huawei_master_key_we + sn_hex + mac_hex).digest(), "H5:sha256(master+sn+mac)"))
+        keys.append((hashlib.sha256(huawei_master_key_we + sn_hex + mac_hex).digest(), "H6:sha256(master+sn+mac)"))
         keys.append((hashlib.sha256(huawei_master_key_we + sn_hex).digest(), "H6:sha256(master+sn_hex)"))
         keys.append((hashlib.sha256(huawei_master_key_we + mac_hex).digest(), "H6:sha256(master+mac_hex)"))
         keys.append((hashlib.sha256(sn_hex + huawei_master_key_we + mac_hex).digest(), "H6:sha256(sn+master+mac)"))
@@ -215,6 +216,8 @@ def score_output(data: bytes) -> int:
     # These thresholds bias toward structured plaintext and away from random binary.
     # In practice for this workflow, false positives often have >120 unique bytes in
     # the first 256 bytes and many control bytes, while XML-like output does not.
+    # Penalty values (80/40) are tuned to demote noisy payloads without suppressing
+    # candidates that already look like XML.
     unique_bytes = len(set(data[:256]))
     if unique_bytes > 120:
         score = max(0, score - 80)
@@ -260,7 +263,8 @@ def main() -> int:
         if len(payload) < 16:
             continue
         if len(payload) % 16 != 0:
-            payload = payload[: len(payload) - (len(payload) % 16)]
+            aligned_length = len(payload) - (len(payload) % 16)
+            payload = payload[:aligned_length]
             if len(payload) < 16:
                 continue
         try:
