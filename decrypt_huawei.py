@@ -166,6 +166,9 @@ def score_output(data: bytes) -> int:
         score += 10
     printable = sum(1 for b in data[:256] if 9 <= b <= 13 or 32 <= b <= 126)
     score += printable
+    # These thresholds bias toward structured plaintext and away from random binary.
+    # In practice for this workflow, false positives often have >120 unique bytes in
+    # the first 256 bytes and many control bytes, while XML-like output does not.
     unique_bytes = len(set(data[:256]))
     if unique_bytes > 120:
         score = max(0, score - 80)
@@ -195,7 +198,7 @@ def main() -> int:
     try:
         offsets = tuple(int(v.strip()) for v in args.offsets.split(",") if v.strip())
     except ValueError:
-        print("[!] --offsets must be a comma-separated list of integers")
+        print("[!] --offsets must be a comma-separated list of integers (example: 0,4,8,12)")
         return 2
 
     blob = read_payload(Path(args.input))
@@ -239,8 +242,9 @@ def main() -> int:
         print("[!] No successful decryption candidates")
         return 1
 
-    _, data, winner, compression, shift = best
+    best_score, data, winner, compression, shift = best
     print("\n=== Best Candidate ===")
+    print(f"score      : {best_score}")
     print(f"name       : {winner.name}")
     print(f"offset     : {winner.offset}")
     print(f"key(hex)   : {winner.key.hex()}")
@@ -251,6 +255,11 @@ def main() -> int:
     text_preview = preview.decode("utf-8", errors="replace")
     print("\n=== Preview ===")
     print(text_preview)
+
+    if best_score < XML_BONUS_SCORE:
+        print("\n[!] No high-confidence XML candidate found (score below 1000).")
+        print("[!] The current best output is likely still a false positive.")
+        return 1
 
     if args.output:
         Path(args.output).write_bytes(data)
